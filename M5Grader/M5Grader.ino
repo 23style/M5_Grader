@@ -3,8 +3,7 @@
  * @brief TAL221ロードセル用の重量測定プログラム（M5Stack Core用）
  * Button A: オフセット設定
  * Button B: キャリブレーション
- * Button C: 未使用
- * 音声フィードバック機能付き
+ * Button C: オフライン/オンライン切り替え
  */
 
 #include <M5Stack.h>
@@ -17,13 +16,14 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <vector>
+#include <map>
 
 // 音階定義
 
 // 基本設定
-const float MAX_WEIGHT = 1000.0;   // 最大計測重量 (g)
 const float KNOWN_WEIGHT = 100.0; // キャリブレーション用の既知の重さ (g)
-const char* CALIB_FILE = "/weight_calibration.txt"; 
+const char* CALIB_FILE = "/weight_calibration.txt";
 
 // 音声設定
 const int TONE_VOLUME = 3;      // 音量 (0-10)
@@ -32,7 +32,6 @@ const int BEEP_INTERVAL = 50;     // ビープ音の間隔 (ms)
 
 // 安定性検出のための設定
 const int STABILITY_SAMPLES = 5;        // 安定性判断のためのサンプル数
-const float STABILITY_THRESHOLD = 0.3;   // 安定判定のための閾値(g)
 const int STABILITY_INTERVAL = 200;      // サンプリング間隔(ms)
 const float ZERO_THRESHOLD = 0.5;       // ゼロ判定のための閾値(g)
 const int SAMPLES = 6 ;                 // 平均化のためのサンプル数
@@ -57,12 +56,24 @@ enum MeasurementState {
 
 
 
-// 柿のサイズ判定用の構造体
-struct SizeRange {
-    const char* size;
-    int start;
-    int end;
+// 規格設定用の構造体（動的対応版）
+struct GradeConfig {
+    String name;           // 規格名（例："A", "6L", "特選"）
+    int minWeight;         // 最小重量
+    int maxWeight;         // 最大重量
+    String soundFile;      // 音声ファイルパス
+    uint16_t color;        // 背景色（RGB565形式）
 };
+
+// 製品設定用の構造体
+struct ProductSettings {
+    String productName;
+    float minWeight;
+    float maxWeight;
+    float stabilityThreshold;
+    std::vector<GradeConfig> grades;
+};
+
 
 // WAVファイル名の定義を拡張
 const char* SYSTEM_WAV_FILES[] = {
@@ -77,35 +88,26 @@ enum SystemSound {
     SOUND_ERROR
 };
 
+// グローバル製品設定変数
+ProductSettings productSettings;
 
-// サイズ範囲の定義
-const SizeRange SIZE_RANGES[] = {
-    {"6L", 350, 999},  // 350g以上は全て6L
-    {"5L", 320, 349},
-    {"4L", 290, 319},
-    {"3L", 260, 289},
-    {"2L", 220, 259},
-    {"L",  190, 219},
-    {"M",  160, 189},
-    {"S",  130, 159},
-    {"2S", 100, 129},
-    {"3S",   50,  99}
-};
-const int SIZE_RANGES_COUNT = sizeof(SIZE_RANGES) / sizeof(SIZE_RANGES[0]);
+// 16進カラーコードをRGB565に変換する関数
+uint16_t hexToRGB565(const String& hexColor) {
+    if (hexColor.length() != 7 || hexColor[0] != '#') {
+        return BLACK; // 無効な形式の場合は黒を返す
+    }
 
-// サイズごとの音声ファイル名を定義
-const char* SIZE_WAV_FILES[] = {
-    "/6L.wav",
-    "/5L.wav",
-    "/4L.wav",
-    "/3L.wav",
-    "/2L.wav",
-    "/L.wav",
-    "/M.wav",
-    "/S.wav",
-    "/2S.wav",
-    "/3S.wav"
-};
+    String hex = hexColor.substring(1); // '#'を除去
+    long color = strtol(hex.c_str(), NULL, 16);
+
+    uint8_t r = (color >> 16) & 0xFF;
+    uint8_t g = (color >> 8) & 0xFF;
+    uint8_t b = color & 0xFF;
+
+    // RGB888からRGB565に変換
+    return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+}
+
 
 
 // 安定性検出用の構造体
@@ -140,7 +142,7 @@ struct WeightReading {
             max_val = max(max_val, values[i]);
         }
         
-        return (max_val - min_val) <= STABILITY_THRESHOLD;
+        return (max_val - min_val) <= productSettings.stabilityThreshold;
     }
     
     float getAverage() {
@@ -293,55 +295,47 @@ protected:
     size_t pos = 0;
 };
 
-// サイズに応じた音声再生（メインループから呼び出し）
-void playWeightSound(const char* size) {
-    const char* wavFile = nullptr;
-    
-    // サイズに対応する音声ファイルを特定
-    for (int i = 0; i < SIZE_RANGES_COUNT; i++) {
-        if (strcmp(size, SIZE_RANGES[i].size) == 0) {
-            wavFile = SIZE_WAV_FILES[i];
-            break;
+// 規格に応じた音声再生（動的対応版）
+void playGradeSound(const String& gradeName) {
+    for (const auto& grade : productSettings.grades) {
+        if (grade.name == gradeName) {
+            const char* wavFile = grade.soundFile.c_str();
+            AudioMessage msg = {wavFile, true};
+            xQueueSend(audioQueue, &msg, 0);
+            return;
         }
     }
-    
-    if (wavFile != nullptr) {
-        AudioMessage msg = {wavFile, true};
-        xQueueSend(audioQueue, &msg, 0);
+}
+
+
+
+
+// 規格に応じた背景色を返す関数（動的対応版）
+uint16_t getGradeBackgroundColor(const String& gradeName) {
+    for (const auto& grade : productSettings.grades) {
+        if (grade.name == gradeName) {
+            return grade.color;
+        }
     }
+    return BLACK;  // デフォルトは黒
 }
 
 
-
-// サイズに応じた背景色を返す関数
-uint16_t getSizeBackgroundColor(const char* size) {
-    if (strcmp(size, "6L") == 0) return 0xF800;      // 赤
-    if (strcmp(size, "5L") == 0) return 0xF81F;      // マゼンタ
-    if (strcmp(size, "4L") == 0) return 0x780F;      // 紫
-    if (strcmp(size, "3L") == 0) return 0x001F;      // 青
-    if (strcmp(size, "2L") == 0) return 0x07FF;      // シアン
-    if (strcmp(size, "L") == 0)  return 0x07E0;      // 緑
-    if (strcmp(size, "M") == 0)  return 0xFFE0;      // 黄
-    if (strcmp(size, "S") == 0)  return 0xFBE0;      // オレンジ
-    if (strcmp(size, "2S") == 0) return 0xC618;      // グレー
-    if (strcmp(size, "3S") == 0) return 0x8410;      // ダークグレー
-    return BLACK;
-}
-
-// サイズを判定する関数
-const char* determineSize(float weight) {
-    // 50g未満は空文字列を返す
-    if (weight < 50.0) {
+// 規格を判定する関数（動的対応版）
+String determineGrade(float weight) {
+    // 最小重量未満は空文字列を返す
+    if (weight < productSettings.minWeight) {
         return "";
     }
-    
-    for (int i = 0; i < SIZE_RANGES_COUNT; i++) {
-        if (weight >= SIZE_RANGES[i].start && weight <= SIZE_RANGES[i].end) {
-            return SIZE_RANGES[i].size;
+
+    for (const auto& grade : productSettings.grades) {
+        if (weight >= grade.minWeight && weight <= grade.maxWeight) {
+            return grade.name;
         }
     }
     return "ERR";  // エラー時
 }
+
 
 // SPIFFSからキャリブレーション係数を読み込む
 void loadCalibrationFactor() {
@@ -511,32 +505,165 @@ struct NetworkConfig {
 NetworkConfig networkConfig;
 bool isOfflineMode = false;
 
-// 設定ファイルを読み込む関数
+
+// 設定ファイルを読み込む関数（エラー時処理中断版）
 bool loadNetworkConfig() {
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.println("Loading Config...");
+
     if (!SD.begin()) {
-        M5.Lcd.println("SDカードの初期化に失敗しました");
-        return false;
+        M5.Lcd.fillScreen(RED);
+        M5.Lcd.setTextColor(WHITE);
+        M5.Lcd.setTextSize(2);
+        M5.Lcd.setCursor(10, 10);
+        M5.Lcd.println("ERROR:");
+        M5.Lcd.println("SD Card init failed");
+        M5.Lcd.println("");
+        M5.Lcd.println("Please check:");
+        M5.Lcd.println("- SD card inserted");
+        M5.Lcd.println("- SD card format");
+        playSystemSound(SOUND_ERROR);
+        while(1); // 処理中断
     }
 
     File configFile = SD.open("/config.json");
     if (!configFile) {
-        M5.Lcd.println("設定ファイルが開けません");
-        return false;
+        M5.Lcd.fillScreen(RED);
+        M5.Lcd.setTextColor(WHITE);
+        M5.Lcd.setTextSize(2);
+        M5.Lcd.setCursor(10, 10);
+        M5.Lcd.println("ERROR:");
+        M5.Lcd.println("config.json not found");
+        M5.Lcd.println("");
+        M5.Lcd.println("Please check:");
+        M5.Lcd.println("- config.json exists");
+        M5.Lcd.println("- in SD card root");
+        playSystemSound(SOUND_ERROR);
+        while(1); // 処理中断
     }
 
-    StaticJsonDocument<512> doc;
+    StaticJsonDocument<2048> doc;
     DeserializationError error = deserializeJson(doc, configFile);
     configFile.close();
 
     if (error) {
-        M5.Lcd.println("JSONのパースに失敗しました");
-        return false;
+        M5.Lcd.fillScreen(RED);
+        M5.Lcd.setTextColor(WHITE);
+        M5.Lcd.setTextSize(2);
+        M5.Lcd.setCursor(10, 10);
+        M5.Lcd.println("ERROR:");
+        M5.Lcd.println("JSON parse failed");
+        M5.Lcd.println("");
+        M5.Lcd.printf("Error code: %s\n", error.c_str());
+        M5.Lcd.println("");
+        M5.Lcd.println("Check JSON syntax");
+        playSystemSound(SOUND_ERROR);
+        while(1); // 処理中断
+    }
+
+    // ネットワーク設定の読み込み
+    if (!doc.containsKey("wifi") || !doc.containsKey("gas_url")) {
+        M5.Lcd.fillScreen(RED);
+        M5.Lcd.setTextColor(WHITE);
+        M5.Lcd.setTextSize(2);
+        M5.Lcd.setCursor(10, 10);
+        M5.Lcd.println("ERROR:");
+        M5.Lcd.println("Missing network config");
+        M5.Lcd.println("");
+        M5.Lcd.println("Required fields:");
+        M5.Lcd.println("- wifi");
+        M5.Lcd.println("- gas_url");
+        playSystemSound(SOUND_ERROR);
+        while(1); // 処理中断
     }
 
     networkConfig.ssid = doc["wifi"]["ssid"].as<String>();
     networkConfig.password = doc["wifi"]["password"].as<String>();
     networkConfig.gas_url = doc["gas_url"].as<String>();
-    networkConfig.device_id = doc["device_id"] | 1; // デフォルト値は1
+    networkConfig.device_id = doc["device_id"] | 1;
+
+    // 製品設定の読み込み
+    if (!doc.containsKey("product_settings")) {
+        M5.Lcd.fillScreen(RED);
+        M5.Lcd.setTextColor(WHITE);
+        M5.Lcd.setTextSize(2);
+        M5.Lcd.setCursor(10, 10);
+        M5.Lcd.println("ERROR:");
+        M5.Lcd.println("Missing product_settings");
+        M5.Lcd.println("");
+        M5.Lcd.println("Required in config.json:");
+        M5.Lcd.println("- product_settings");
+        playSystemSound(SOUND_ERROR);
+        while(1); // 処理中断
+    }
+
+    JsonObject productObj = doc["product_settings"];
+
+    if (!productObj.containsKey("grades") || productObj["grades"].size() == 0) {
+        M5.Lcd.fillScreen(RED);
+        M5.Lcd.setTextColor(WHITE);
+        M5.Lcd.setTextSize(2);
+        M5.Lcd.setCursor(10, 10);
+        M5.Lcd.println("ERROR:");
+        M5.Lcd.println("No grades defined");
+        M5.Lcd.println("");
+        M5.Lcd.println("At least one grade");
+        M5.Lcd.println("must be defined in");
+        M5.Lcd.println("product_settings");
+        playSystemSound(SOUND_ERROR);
+        while(1); // 処理中断
+    }
+
+    productSettings.productName = productObj["product_name"].as<String>();
+    productSettings.minWeight = productObj["min_weight"] | 50.0;
+    productSettings.maxWeight = productObj["max_weight"] | 1000.0;
+    productSettings.stabilityThreshold = productObj["stability_threshold"] | 0.3;
+
+    // 規格設定の読み込み
+    productSettings.grades.clear();
+
+    for (JsonObject grade : productObj["grades"].as<JsonArray>()) {
+        if (!grade.containsKey("name") || !grade.containsKey("min_weight") ||
+            !grade.containsKey("max_weight") || !grade.containsKey("sound_file") ||
+            !grade.containsKey("color")) {
+            M5.Lcd.fillScreen(RED);
+            M5.Lcd.setTextColor(WHITE);
+            M5.Lcd.setTextSize(2);
+            M5.Lcd.setCursor(10, 10);
+            M5.Lcd.println("ERROR:");
+            M5.Lcd.println("Invalid grade config");
+            M5.Lcd.println("");
+            M5.Lcd.println("Each grade needs:");
+            M5.Lcd.println("name, min_weight,");
+            M5.Lcd.println("max_weight, sound_file,");
+            M5.Lcd.println("color");
+            playSystemSound(SOUND_ERROR);
+            while(1); // 処理中断
+        }
+
+        GradeConfig gradeConfig;
+        gradeConfig.name = grade["name"].as<String>();
+        gradeConfig.minWeight = grade["min_weight"];
+        gradeConfig.maxWeight = grade["max_weight"];
+        gradeConfig.soundFile = grade["sound_file"].as<String>();
+
+        String colorStr = grade["color"].as<String>();
+        gradeConfig.color = hexToRGB565(colorStr);
+
+        productSettings.grades.push_back(gradeConfig);
+    }
+
+    M5.Lcd.fillScreen(GREEN);
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.println("Config Loaded!");
+    M5.Lcd.printf("Product: %s\n", productSettings.productName.c_str());
+    M5.Lcd.printf("Grades: %d\n", productSettings.grades.size());
+    playSystemSound(SOUND_INFO);
+    delay(2000);
 
     return true;
 }
@@ -621,25 +748,24 @@ void displayWeight(float weight) {
         updateMeasurementState(weight);
         
         sprite.fillSprite(BLACK);
-        
-        const char* size = determineSize(weight);
-        // 50g未満の場合は何も表示しない
-        if (weight >= 50.0 && currentState == STATE_STABLE) {
+
+        String grade = determineGrade(weight);
+        // 最小重量未満の場合は何も表示しない
+        if (weight >= productSettings.minWeight && currentState == STATE_STABLE) {
             if (previousState != STATE_STABLE) {
-                playWeightSound(size);
+                playGradeSound(grade);
             }
-            
-            uint16_t bgColor = getSizeBackgroundColor(size);
+
+            uint16_t bgColor = getGradeBackgroundColor(grade);
             sprite.fillRect(0, 0, 320, 180, bgColor);
 
             sprite.setFreeFont(FSSB24);
             sprite.setTextSize(4);
             sprite.setTextColor(WHITE, bgColor);
-            
-            int textWidth = sprite.textWidth(size);
+            int textWidth = sprite.textWidth(grade.c_str());
             int x = (320 - textWidth) / 2;
             sprite.setCursor(x, 150);
-            sprite.print(size);
+            sprite.print(grade.c_str());
             sprite.setTextFont(0);
         }
         
@@ -655,8 +781,8 @@ void displayWeight(float weight) {
         // 状態表示
         sprite.setTextSize(2);
         sprite.setCursor(230, 200);
-        if (weight < 50.0) {
-            // 50g未満の場合は特別な表示
+        if (weight < productSettings.minWeight) {
+            // 最小重量未満の場合は特別な表示
             sprite.setTextColor(CYAN, BLACK);
             sprite.print("WAIT");
         } else {
@@ -676,8 +802,8 @@ void displayWeight(float weight) {
             }
         }
         
-        // オーバーロード警告（変更なし）
-        if (weight > MAX_WEIGHT) {
+        // オーバーロード警告
+        if (weight > productSettings.maxWeight) {
             sprite.setTextColor(RED, BLACK);
             sprite.setTextSize(3);
             textWidth = sprite.textWidth("OVER");
@@ -714,9 +840,9 @@ void displayWeight(float weight) {
         
         // 状態が安定してGASにまだ送信していない場合、データを送信
         static bool dataSent = false;
-        if (currentState == STATE_STABLE && !dataSent && weight >= 50.0) {
-            const char* size = determineSize(weight);
-            sendToGAS(size, weight);
+        if (currentState == STATE_STABLE && !dataSent && weight >= productSettings.minWeight) {
+            String grade = determineGrade(weight);
+            sendToGAS(grade.c_str(), weight);
             dataSent = true;
         } else if (currentState != STATE_STABLE) {
             dataSent = false;
@@ -781,11 +907,8 @@ void setup() {
     // 保存されたキャリブレーション係数を読み込む
     loadCalibrationFactor();
 
-    // 設定ファイルの読み込み
-    if (!loadNetworkConfig()) {
-        M5.Lcd.println("Config load failed");
-        delay(2000);
-    }
+    // 設定ファイルの読み込み（エラー時は処理中断）
+    loadNetworkConfig();
 
     // WiFi接続処理の追加
     connectToWiFi();
