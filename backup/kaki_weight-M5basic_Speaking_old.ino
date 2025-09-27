@@ -14,9 +14,6 @@
 #include "AudioFileSourceSD.h"
 #include "AudioGeneratorWAV.h"
 #include "AudioOutputI2S.h"
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <ArduinoJson.h>
 
 // 音階定義
 
@@ -37,16 +34,6 @@ const int STABILITY_INTERVAL = 200;      // サンプリング間隔(ms)
 const float ZERO_THRESHOLD = 0.5;       // ゼロ判定のための閾値(g)
 const int SAMPLES = 6 ;                 // 平均化のためのサンプル数
 
-// 自動オフセット用の定数
-const unsigned long AUTO_OFFSET_INTERVAL = 300000;  // 5分ごとに自動オフセット
-const float AUTO_OFFSET_THRESHOLD = 1.2;          // この値以下なら自動オフセット実行
-const unsigned long STABLE_TIME = 3000;           // 3秒間安定していること
-
-// グローバル変数
-unsigned long lastAutoOffset = 0;
-unsigned long stableStartTime = 0;
-bool isStableForOffset = false;
-
 // 測定状態を表す列挙型
 enum MeasurementState {
     STATE_READY,         // 測定準備完了
@@ -54,8 +41,6 @@ enum MeasurementState {
     STATE_STABLE,        // 測定値安定
     STATE_ZERO          // ゼロ状態
 };
-
-
 
 // 柿のサイズ判定用の構造体
 struct SizeRange {
@@ -500,116 +485,6 @@ void updateMeasurementState(float weight) {
     }
 }
 
-// GAS関連の設定
-struct NetworkConfig {
-    String ssid;
-    String password;
-    String gas_url;
-    int device_id;
-};
-
-NetworkConfig networkConfig;
-bool isOfflineMode = false;
-
-// 設定ファイルを読み込む関数
-bool loadNetworkConfig() {
-    if (!SD.begin()) {
-        M5.Lcd.println("SDカードの初期化に失敗しました");
-        return false;
-    }
-
-    File configFile = SD.open("/config.json");
-    if (!configFile) {
-        M5.Lcd.println("設定ファイルが開けません");
-        return false;
-    }
-
-    StaticJsonDocument<512> doc;
-    DeserializationError error = deserializeJson(doc, configFile);
-    configFile.close();
-
-    if (error) {
-        M5.Lcd.println("JSONのパースに失敗しました");
-        return false;
-    }
-
-    networkConfig.ssid = doc["wifi"]["ssid"].as<String>();
-    networkConfig.password = doc["wifi"]["password"].as<String>();
-    networkConfig.gas_url = doc["gas_url"].as<String>();
-    networkConfig.device_id = doc["device_id"] | 1; // デフォルト値は1
-
-    return true;
-}
-
-// WiFi接続関数
-void connectToWiFi() {
-    if (isOfflineMode) return;
-    
-    WiFi.begin(networkConfig.ssid.c_str(), networkConfig.password.c_str());
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-        delay(500);
-        attempts++;
-    }
-}
-
-// GASにデータを送信する関数
-void sendToGAS(const char* size, float weight) {
-    if (isOfflineMode || WiFi.status() != WL_CONNECTED) return;
-
-    HTTPClient http;
-    http.begin(networkConfig.gas_url.c_str());
-    http.addHeader("Content-Type", "application/json");
-
-    // 現在時刻を取得（NTPは別途設定が必要）
-    char timeString[20];
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo)) {
-        strftime(timeString, sizeof(timeString), "%Y/%m/%d %H:%M:%S", &timeinfo);
-    } else {
-        strcpy(timeString, "Time not set");
-    }
-
-    // JSONデータの作成
-    StaticJsonDocument<200> doc;
-    doc["size"] = size;
-    doc["weight"] = weight;
-    doc["timestamp"] = timeString;
-    doc["device_id"] = networkConfig.device_id;
-
-    String jsonString;
-    serializeJson(doc, jsonString);
-
-    int httpResponseCode = http.POST(jsonString);
-    http.end();
-}
-
-// 自動オフセットのチェックと実行
-void checkAndAutoOffset(float weight) {
-    unsigned long currentTime = millis();
-    
-    // 重量が閾値以下で安定している場合
-    if (abs(weight) < AUTO_OFFSET_THRESHOLD && weightBuffer.isStable()) {
-        if (!isStableForOffset) {
-            stableStartTime = currentTime;
-            isStableForOffset = true;
-        }
-        
-        // 一定時間安定していて、前回のオフセットから十分時間が経過
-        if ((currentTime - stableStartTime) >= STABLE_TIME && 
-            (currentTime - lastAutoOffset) >= AUTO_OFFSET_INTERVAL) {
-            
-            weight_i2c.setOffset();  // オフセットを実行
-            lastAutoOffset = currentTime;
-            
-            // デバッグ用（必要に応じてコメントアウト）
-            Serial.println("Auto offset executed");
-        }
-    } else {
-        isStableForOffset = false;
-    }
-}
-
 // 画面表示関数
 void displayWeight(float weight) {
     static unsigned long lastUpdateTime = 0;
@@ -691,17 +566,6 @@ void displayWeight(float weight) {
             }
         }
         
-
-        // オフラインモード表示の追加（ボタンガイドの上）
-        if (isOfflineMode) {
-            sprite.fillRect(0, 195, 100, 25, RED);
-            sprite.setTextColor(WHITE, RED);
-            sprite.setTextSize(2);
-            sprite.setCursor(10, 200);
-            sprite.print("OFFLINE");
-        }
-
-
         // ボタンガイド（変更なし）
         sprite.setTextColor(WHITE, BLACK);
         sprite.setTextSize(2);
@@ -712,17 +576,6 @@ void displayWeight(float weight) {
         
         sprite.pushSprite(0, 0);
         
-        // 状態が安定してGASにまだ送信していない場合、データを送信
-        static bool dataSent = false;
-        if (currentState == STATE_STABLE && !dataSent && weight >= 50.0) {
-            const char* size = determineSize(weight);
-            sendToGAS(size, weight);
-            dataSent = true;
-        } else if (currentState != STATE_STABLE) {
-            dataSent = false;
-        }
-
-
         lastUpdateTime = currentTime;
     }
 }
@@ -780,19 +633,7 @@ void setup() {
     
     // 保存されたキャリブレーション係数を読み込む
     loadCalibrationFactor();
-
-    // 設定ファイルの読み込み
-    if (!loadNetworkConfig()) {
-        M5.Lcd.println("Config load failed");
-        delay(2000);
-    }
-
-    // WiFi接続処理の追加
-    connectToWiFi();
-
-    // NTP設定
-    configTime(9 * 3600, 0, "ntp.nict.jp", "time.google.com");
-
+    
     // 初期オフセットの設定
     delay(1000);
     setInitialOffset();
@@ -826,17 +667,8 @@ void loop() {
     if (M5.BtnB.wasPressed()) {
         calibrate();
     }
-
-    // ボタンC（オフラインモード切り替え）
-    if (M5.BtnC.wasPressed()) {
-        isOfflineMode = !isOfflineMode;
-        if (!isOfflineMode) {
-            connectToWiFi(); // オンラインモードに戻す時にWiFi再接続
-        }
-    }
-
+    
     float weight = getAccurateWeight();
-    checkAndAutoOffset(weight);  // 自動オフセットのチェック
     displayWeight(weight);
     
     delay(50); // より短いディレイに変更

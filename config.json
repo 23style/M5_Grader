@@ -1,0 +1,8 @@
+{
+  "wifi": {
+    "ssid": "yourSSID",
+    "password": "password"
+  },
+  "gas_url": "https://script.google.com/macros/..../exec",
+  "device_id": 1
+}

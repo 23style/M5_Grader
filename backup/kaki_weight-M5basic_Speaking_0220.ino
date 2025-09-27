@@ -37,16 +37,6 @@ const int STABILITY_INTERVAL = 200;      // サンプリング間隔(ms)
 const float ZERO_THRESHOLD = 0.5;       // ゼロ判定のための閾値(g)
 const int SAMPLES = 6 ;                 // 平均化のためのサンプル数
 
-// 自動オフセット用の定数
-const unsigned long AUTO_OFFSET_INTERVAL = 300000;  // 5分ごとに自動オフセット
-const float AUTO_OFFSET_THRESHOLD = 1.2;          // この値以下なら自動オフセット実行
-const unsigned long STABLE_TIME = 3000;           // 3秒間安定していること
-
-// グローバル変数
-unsigned long lastAutoOffset = 0;
-unsigned long stableStartTime = 0;
-bool isStableForOffset = false;
-
 // 測定状態を表す列挙型
 enum MeasurementState {
     STATE_READY,         // 測定準備完了
@@ -54,8 +44,6 @@ enum MeasurementState {
     STATE_STABLE,        // 測定値安定
     STATE_ZERO          // ゼロ状態
 };
-
-
 
 // 柿のサイズ判定用の構造体
 struct SizeRange {
@@ -584,32 +572,6 @@ void sendToGAS(const char* size, float weight) {
     http.end();
 }
 
-// 自動オフセットのチェックと実行
-void checkAndAutoOffset(float weight) {
-    unsigned long currentTime = millis();
-    
-    // 重量が閾値以下で安定している場合
-    if (abs(weight) < AUTO_OFFSET_THRESHOLD && weightBuffer.isStable()) {
-        if (!isStableForOffset) {
-            stableStartTime = currentTime;
-            isStableForOffset = true;
-        }
-        
-        // 一定時間安定していて、前回のオフセットから十分時間が経過
-        if ((currentTime - stableStartTime) >= STABLE_TIME && 
-            (currentTime - lastAutoOffset) >= AUTO_OFFSET_INTERVAL) {
-            
-            weight_i2c.setOffset();  // オフセットを実行
-            lastAutoOffset = currentTime;
-            
-            // デバッグ用（必要に応じてコメントアウト）
-            Serial.println("Auto offset executed");
-        }
-    } else {
-        isStableForOffset = false;
-    }
-}
-
 // 画面表示関数
 void displayWeight(float weight) {
     static unsigned long lastUpdateTime = 0;
@@ -836,7 +798,6 @@ void loop() {
     }
 
     float weight = getAccurateWeight();
-    checkAndAutoOffset(weight);  // 自動オフセットのチェック
     displayWeight(weight);
     
     delay(50); // より短いディレイに変更

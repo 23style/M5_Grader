@@ -14,33 +14,11 @@
 #include "AudioFileSourceSD.h"
 #include "AudioGeneratorWAV.h"
 #include "AudioOutputI2S.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 
 // 音階定義
-#define NOTE_D0 -1
-#define NOTE_D1 294
-#define NOTE_D2 330
-#define NOTE_D3 350
-#define NOTE_D4 393
-#define NOTE_D5 441
-#define NOTE_D6 495
-#define NOTE_D7 556
-
-#define NOTE_DL1 147
-#define NOTE_DL2 165
-#define NOTE_DL3 175
-#define NOTE_DL4 196
-#define NOTE_DL5 221
-#define NOTE_DL6 248
-#define NOTE_DL7 278
-
-#define NOTE_DH1 589
-#define NOTE_DH2 661
-#define NOTE_DH3 700
-#define NOTE_DH4 786
-#define NOTE_DH5 882
-#define NOTE_DH6 990
-#define NOTE_DH7 112
-
 
 // 基本設定
 const float MAX_WEIGHT = 1000.0;   // 最大計測重量 (g)
@@ -57,7 +35,7 @@ const int STABILITY_SAMPLES = 5;        // 安定性判断のためのサンプ�
 const float STABILITY_THRESHOLD = 0.3;   // 安定判定のための閾値(g)
 const int STABILITY_INTERVAL = 200;      // サンプリング間隔(ms)
 const float ZERO_THRESHOLD = 0.5;       // ゼロ判定のための閾値(g)
-const int SAMPLES = 10;                 // 平均化のためのサンプル数
+const int SAMPLES = 6 ;                 // 平均化のためのサンプル数
 
 // 測定状態を表す列挙型
 enum MeasurementState {
@@ -74,6 +52,20 @@ struct SizeRange {
     int end;
 };
 
+// WAVファイル名の定義を拡張
+const char* SYSTEM_WAV_FILES[] = {
+    "/info.wav",   // システム情報、オフセット完了時
+    "/zero.wav",   // ゼロ検出時
+    "/error.wav"   // エラー時
+};
+// システムサウンド用のインデックス
+enum SystemSound {
+    SOUND_INFO,
+    SOUND_ZERO,
+    SOUND_ERROR
+};
+
+
 // サイズ範囲の定義
 const SizeRange SIZE_RANGES[] = {
     {"6L", 350, 999},  // 350g以上は全て6L
@@ -85,7 +77,7 @@ const SizeRange SIZE_RANGES[] = {
     {"M",  160, 189},
     {"S",  130, 159},
     {"2S", 100, 129},
-    {"3S",   0,  99}
+    {"3S",   50,  99}
 };
 const int SIZE_RANGES_COUNT = sizeof(SIZE_RANGES) / sizeof(SIZE_RANGES[0]);
 
@@ -188,19 +180,34 @@ TaskHandle_t audioTaskHandle = NULL;
 // オーディオ再生用キュー
 QueueHandle_t audioQueue;
 
+// WAVファイル再生関数の修正
+void playSystemSound(SystemSound sound) {
+    const char* wavFile = SYSTEM_WAV_FILES[sound];
+    if (wavFile != nullptr) {
+        AudioMessage msg = {wavFile, true};
+        // メッセージ送信（タイムアウト付き）
+//        xQueueSend(audioQueue, &msg, pdMS_TO_TICKS(100));
+    }
+}
 // オーディオ再生タスク
 void audioTask(void* parameter) {
     AudioGeneratorWAV *wav_task = nullptr;
     AudioFileSourceSD *file_task = nullptr;
-    AudioOutputI2S *out_task = new AudioOutputI2S(0, 1);
+    AudioOutputI2S *out_task = new AudioOutputI2S(0, 1);  // M5Stack内蔵スピーカー用
     out_task->SetOutputModeMono(true);
     out_task->SetGain(0.8);
 
     AudioMessage msg;
     
     while(true) {
-        if (xQueueReceive(audioQueue, &msg, 0) == pdTRUE) {
+        // メッセージ待ち（ブロッキングモード）
+        if (xQueueReceive(audioQueue, &msg, portMAX_DELAY) == pdTRUE) {
             if (msg.play && msg.filename != nullptr) {
+                // ファイルの存在確認
+                if (!SD.exists(msg.filename)) {
+                    continue;  // ファイルが存在しない場合はスキップ
+                }
+
                 // 既存の再生を停止
                 if (wav_task != nullptr) {
                     wav_task->stop();
@@ -215,23 +222,65 @@ void audioTask(void* parameter) {
                 // 新しい音声ファイルを再生
                 file_task = new AudioFileSourceSD(msg.filename);
                 wav_task = new AudioGeneratorWAV();
+                
                 if (wav_task->begin(file_task, out_task)) {
                     while(wav_task->isRunning()) {
                         if (!wav_task->loop()) {
                             wav_task->stop();
+                            break;
                         }
-                        vTaskDelay(1);
+                        vTaskDelay(1);  // 他のタスクに実行時間を与える
                     }
                 }
-                
-                // WAV再生後にスピーカーを再初期化
-                M5.Speaker.begin();
-                M5.Speaker.setVolume(TONE_VOLUME);
+
+                // クリーンアップ
+                if (wav_task != nullptr) {
+                    delete wav_task;
+                    wav_task = nullptr;
+                }
+                if (file_task != nullptr) {
+                    delete file_task;
+                    file_task = nullptr;
+                }
             }
         }
-        vTaskDelay(1);
+        vTaskDelay(1);  // タスクの実行間隔を調整
     }
 }
+
+// WAVファイルクラスの拡張（無音部分を追加）
+class AudioFileSourceSDWithSilence : public AudioFileSourceSD {
+public:
+    AudioFileSourceSDWithSilence(const char* filename) : AudioFileSourceSD(filename) {
+        // コンストラクタ
+    }
+
+    virtual bool open(const char* filename) {
+        bool result = AudioFileSourceSD::open(filename);
+        if (result) {
+            // WAVヘッダーの後に無音部分を追加
+            pos = 44;  // WAVヘッダーのサイズ
+        }
+        return result;
+    }
+
+    virtual uint32_t read(void *data, uint32_t len) {
+        if (pos == 44) {
+            // 先頭に短い無音部分を追加
+            uint8_t* buffer = (uint8_t*)data;
+            for (int i = 0; i < 100; i++) {
+                buffer[i] = 0x80;  // 16bit PCMの中央値
+            }
+            pos += 100;
+            return 100;
+        }
+        return AudioFileSourceSD::read(data, len);
+    }
+
+protected:
+    size_t pos = 0;
+};
+
 // サイズに応じた音声再生（メインループから呼び出し）
 void playWeightSound(const char* size) {
     const char* wavFile = nullptr;
@@ -251,70 +300,6 @@ void playWeightSound(const char* size) {
 }
 
 
-// スピーカー関連の関数群
-void playTone(int frequency, int duration) {
-    if (!waitingForSpeakerReinit) {  // スピーカー再初期化待ちでない場合のみ再生
-        M5.Speaker.tone(frequency, duration);
-        delay(duration);
-        M5.Speaker.mute();
-        delay(50);
-    }
-}
-void playStartupSound() {
-    // スタートアップ時のメロディ (ドミソド'の音階)
-    playTone(NOTE_D1, 1000);  // ド
-    delay(200);
-    playTone(NOTE_D3, 1000);  // ミ
-    delay(200);
-    playTone(NOTE_D5, 1000);  // ソ
-    delay(200);
-    playTone(NOTE_DH1, 1500); // ド'
-}
-
-void playErrorSound() {
-    // エラー時の下降音
-    playTone(NOTE_D6, 150);
-    delay(200);
-    playTone(NOTE_D3, 300);
-}
-
-void playSuccessSound() {
-    // 成功時の上昇音
-    playTone(NOTE_D1, 100);
-    delay(200);
-    playTone(NOTE_D3, 100);
-    delay(200);
-    playTone(NOTE_D5, 200);
-}
-
-void playMeasurementCompleteSound() {
-    // 測定完了時のメロディ
- //   playTone(NOTE_D5, 100);
- //   delay(200);
-    playTone(NOTE_DH1, 100);
-//    delay(200);
-    playTone(NOTE_DH3, 150);
-}
-
-void playZeroSound() {
-    // ゼロ点検出時の音
-    playTone(NOTE_D4, 50);
-    delay(200);
-    playTone(NOTE_D4, 50);
-}
-
-void playButtonSound() {
-    // ボタン押下時の音
-    playTone(NOTE_D6, 50);
-}
-
-void playCalibrationBeep() {
-    // キャリブレーション時の案内音
-    for (int i = 0; i < 3; i++) {
-        playTone(NOTE_D5, BEEP_DURATION);
-        delay(BEEP_INTERVAL);
-    }
-}
 
 // サイズに応じた背景色を返す関数
 uint16_t getSizeBackgroundColor(const char* size) {
@@ -333,6 +318,11 @@ uint16_t getSizeBackgroundColor(const char* size) {
 
 // サイズを判定する関数
 const char* determineSize(float weight) {
+    // 50g未満は空文字列を返す
+    if (weight < 50.0) {
+        return "";
+    }
+    
     for (int i = 0; i < SIZE_RANGES_COUNT; i++) {
         if (weight >= SIZE_RANGES[i].start && weight <= SIZE_RANGES[i].end) {
             return SIZE_RANGES[i].size;
@@ -345,7 +335,7 @@ const char* determineSize(float weight) {
 void loadCalibrationFactor() {
     if (!SPIFFS.begin(true)) {
         M5.Lcd.println("SPIFFS Mount Failed");
-        playErrorSound();
+        playSystemSound(SOUND_ERROR);  // エラー音に変更
         return;
     }
 
@@ -357,7 +347,6 @@ void loadCalibrationFactor() {
             file.close();
             
             M5.Lcd.printf("Loaded cal: %0.4f\n", calibration_factor);
-            // playSuccessSound();
             delay(500);
         }
     }
@@ -370,18 +359,16 @@ void saveCalibrationFactor() {
         file.println(calibration_factor, 4);
         file.close();
         M5.Lcd.println("Calibration saved");
-        playSuccessSound();
+        playSystemSound(SOUND_INFO);  // 保存成功音に変更
         delay(1000);
     } else {
         M5.Lcd.println("Save failed");
-        playErrorSound();
+        playSystemSound(SOUND_ERROR);  // エラー音に変更
         delay(1000);
     }
 }
 
 void setInitialOffset() {
-    playButtonSound();  // ボタン押下音を追加
-    
     M5.Lcd.fillScreen(BLACK);
     M5.Lcd.setTextSize(2);
     M5.Lcd.setCursor(10, 10);
@@ -390,14 +377,6 @@ void setInitialOffset() {
     M5.Lcd.println("Remove all weight");
     M5.Lcd.println("Please wait...");
     
-    // カウントダウン音
-    for (int i = 3; i > 0; i--) {
-        M5.Lcd.printf("%d...", i);
-        playTone(1000, 200);
-        delay(500);
-    }
-    playTone(1500, 500);
-    
     weight_i2c.setOffset();
     weightBuffer.clear();
     currentState = STATE_READY;
@@ -405,13 +384,12 @@ void setInitialOffset() {
     lastStableWeight = 0.0;
     
     M5.Lcd.println("Offset Complete!");
-//    playSuccessSound();
+    playSystemSound(SOUND_INFO);  // オフセット完了時
     delay(1000);
 }
 
+
 void calibrate() {
-    playButtonSound();  // ボタン押下音を追加
-    
     M5.Lcd.fillScreen(BLACK);
     M5.Lcd.setTextSize(2);
     M5.Lcd.setCursor(10, 10);
@@ -427,7 +405,6 @@ void calibrate() {
     M5.Lcd.printf("Current: %0.1fg\n", KNOWN_WEIGHT);
     
     delay(2000);
-    playCalibrationBeep();
     
     M5.Lcd.println("\nMeasuring...");
     float measured = getAveragedWeight(20);
@@ -436,7 +413,7 @@ void calibrate() {
     if (calibration_factor <= 0 || calibration_factor > 10.0) {
         M5.Lcd.println("Warning: Unusual cal value");
         M5.Lcd.println("Check weight placement");
-        playErrorSound();
+        playSystemSound(SOUND_ERROR);
         delay(2000);
         return;
     }
@@ -445,6 +422,7 @@ void calibrate() {
     M5.Lcd.printf("Factor:%0.4f\n", calibration_factor);
     
     saveCalibrationFactor();
+    playSystemSound(SOUND_INFO);
     
     weightBuffer.clear();
     currentState = STATE_READY;
@@ -458,7 +436,7 @@ float getAveragedWeight(int samples) {
     float sum = 0;
     
     // 最初の数回の読み取りを捨てる
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 3; i++) {
         weight_i2c.getWeight();
         delay(10);
     }
@@ -486,6 +464,7 @@ float getAccurateWeight() {
     return calibratedWeight;
 }
 
+
 void updateMeasurementState(float weight) {
     previousState = currentState;
     
@@ -501,12 +480,96 @@ void updateMeasurementState(float weight) {
         currentState = STATE_MEASURING;
     }
     
-    // 状態が変化した時のみ音を鳴らす
+    // 状態が変化した時のみ音声を再生
     if (currentState != previousState) {
         if (currentState == STATE_ZERO) {
-            playZeroSound();
+            playSystemSound(SOUND_ZERO);  // ゼロ検出時
         }
     }
+}
+
+// GAS関連の設定
+struct NetworkConfig {
+    String ssid;
+    String password;
+    String gas_url;
+    int device_id;
+};
+
+NetworkConfig networkConfig;
+bool isOfflineMode = false;
+
+// 設定ファイルを読み込む関数
+bool loadNetworkConfig() {
+    if (!SD.begin()) {
+        M5.Lcd.println("SDカードの初期化に失敗しました");
+        return false;
+    }
+
+    File configFile = SD.open("/config.json");
+    if (!configFile) {
+        M5.Lcd.println("設定ファイルが開けません");
+        return false;
+    }
+
+    StaticJsonDocument<512> doc;
+    DeserializationError error = deserializeJson(doc, configFile);
+    configFile.close();
+
+    if (error) {
+        M5.Lcd.println("JSONのパースに失敗しました");
+        return false;
+    }
+
+    networkConfig.ssid = doc["wifi"]["ssid"].as<String>();
+    networkConfig.password = doc["wifi"]["password"].as<String>();
+    networkConfig.gas_url = doc["gas_url"].as<String>();
+    networkConfig.device_id = doc["device_id"] | 1; // デフォルト値は1
+
+    return true;
+}
+
+// WiFi接続関数
+void connectToWiFi() {
+    if (isOfflineMode) return;
+    
+    WiFi.begin(networkConfig.ssid.c_str(), networkConfig.password.c_str());
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        attempts++;
+    }
+}
+
+// GASにデータを送信する関数
+void sendToGAS(const char* size, float weight) {
+    if (isOfflineMode || WiFi.status() != WL_CONNECTED) return;
+
+    HTTPClient http;
+    http.begin(networkConfig.gas_url.c_str());
+    http.addHeader("Content-Type", "application/json");
+
+    // 現在時刻を取得（NTPは別途設定が必要）
+    char timeString[20];
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+        strftime(timeString, sizeof(timeString), "%Y/%m/%d %H:%M:%S", &timeinfo);
+    } else {
+        strcpy(timeString, "Time not set");
+    }
+
+    // JSONデータの作成
+    StaticJsonDocument<200> doc;
+    doc["size"] = size;
+    doc["weight"] = weight;
+    doc["timestamp"] = timeString;
+    doc["device_id"] = networkConfig.device_id;
+
+    String jsonString;
+    serializeJson(doc, jsonString);
+
+    int httpResponseCode = http.POST(jsonString);
+    http.end();
 }
 
 // 画面表示関数
@@ -522,8 +585,8 @@ void displayWeight(float weight) {
         sprite.fillSprite(BLACK);
         
         const char* size = determineSize(weight);
-        if (currentState == STATE_STABLE) {
-            // 安定状態になったら必ず音声を再生
+        // 50g未満の場合は何も表示しない
+        if (weight >= 50.0 && currentState == STATE_STABLE) {
             if (previousState != STATE_STABLE) {
                 playWeightSound(size);
             }
@@ -531,7 +594,6 @@ void displayWeight(float weight) {
             uint16_t bgColor = getSizeBackgroundColor(size);
             sprite.fillRect(0, 0, 320, 180, bgColor);
 
-            // サイズを大きく表示
             sprite.setFreeFont(FSSB24);
             sprite.setTextSize(4);
             sprite.setTextColor(WHITE, bgColor);
@@ -551,25 +613,32 @@ void displayWeight(float weight) {
         int textWidth = sprite.textWidth(weightStr);
         sprite.setCursor((320 - textWidth) / 2, 190);
         sprite.print(weightStr);
+        
         // 状態表示
         sprite.setTextSize(2);
         sprite.setCursor(230, 200);
-        switch (currentState) {
-            case STATE_MEASURING:
-                sprite.setTextColor(YELLOW, BLACK);
-                sprite.print("MEAS");
-                break;
-            case STATE_STABLE:
-                sprite.setTextColor(GREEN, BLACK);
-                sprite.print("DONE");
-                break;
-            case STATE_ZERO:
-                sprite.setTextColor(CYAN, BLACK);
-                sprite.print("ZERO");
-                break;
+        if (weight < 50.0) {
+            // 50g未満の場合は特別な表示
+            sprite.setTextColor(CYAN, BLACK);
+            sprite.print("WAIT");
+        } else {
+            switch (currentState) {
+                case STATE_MEASURING:
+                    sprite.setTextColor(YELLOW, BLACK);
+                    sprite.print("MEAS");
+                    break;
+                case STATE_STABLE:
+                    sprite.setTextColor(GREEN, BLACK);
+                    sprite.print("DONE");
+                    break;
+                case STATE_ZERO:
+                    sprite.setTextColor(CYAN, BLACK);
+                    sprite.print("ZERO");
+                    break;
+            }
         }
         
-        // オーバーロード警告
+        // オーバーロード警告（変更なし）
         if (weight > MAX_WEIGHT) {
             sprite.setTextColor(RED, BLACK);
             sprite.setTextSize(3);
@@ -577,15 +646,25 @@ void displayWeight(float weight) {
             sprite.setCursor((320 - textWidth) / 2, 140);
             sprite.print("OVER");
             
-            // オーバーロード警告音を追加
             static unsigned long lastWarningTime = 0;
-            if (currentTime - lastWarningTime >= 1000) {  // 1秒ごとに警告音
-                playErrorSound();
+            if (currentTime - lastWarningTime >= 1000) {
+                playSystemSound(SOUND_ERROR);
                 lastWarningTime = currentTime;
             }
         }
         
-        // ボタンガイド
+
+        // オフラインモード表示の追加（ボタンガイドの上）
+        if (isOfflineMode) {
+            sprite.fillRect(0, 195, 100, 25, RED);
+            sprite.setTextColor(WHITE, RED);
+            sprite.setTextSize(2);
+            sprite.setCursor(10, 200);
+            sprite.print("OFFLINE");
+        }
+
+
+        // ボタンガイド（変更なし）
         sprite.setTextColor(WHITE, BLACK);
         sprite.setTextSize(2);
         sprite.setCursor(15, 220);
@@ -593,24 +672,26 @@ void displayWeight(float weight) {
         sprite.setCursor(130, 220);
         sprite.print("Calibrate");
         
-        // スプライトを画面に表示
         sprite.pushSprite(0, 0);
         
+        // 状態が安定してGASにまだ送信していない場合、データを送信
+        static bool dataSent = false;
+        if (currentState == STATE_STABLE && !dataSent && weight >= 50.0) {
+            const char* size = determineSize(weight);
+            sendToGAS(size, weight);
+            dataSent = true;
+        } else if (currentState != STATE_STABLE) {
+            dataSent = false;
+        }
+
+
         lastUpdateTime = currentTime;
     }
 }
 
 void setup() {
-    M5.begin();
+     M5.begin();
     M5.Power.begin();
-    
-    // スピーカーの初期化
-    M5.Speaker.begin();
-    M5.Speaker.setVolume(TONE_VOLUME);
-
-    // オーディオ出力の初期化
-    out = new AudioOutputI2S(0, 1);
-    out->SetOutputModeMono(true);
     
     // SDカードの初期化確認
     if (!SD.begin()) {
@@ -618,24 +699,25 @@ void setup() {
         while (1);
     }
 
-    // オーディオキューの作成
+    // オーディオキューの作成（サイズを1に設定）
     audioQueue = xQueueCreate(1, sizeof(AudioMessage));
     
-    // オーディオタスクの作成（Core 0で実行）
+    // オーディオタスクの作成（優先度を上げる）
     xTaskCreatePinnedToCore(
-        audioTask,          // タスク関数
-        "AudioTask",        // タスク名
-        8192,              // スタックサイズ
-        NULL,              // パラメータ
-        1,                 // 優先度
-        &audioTaskHandle,  // タスクハンドル
-        0                  // 実行するコア (0)
+        audioTask,
+        "AudioTask",
+        8192,
+        NULL,
+        2,  // 優先度を上げる（1→2）
+        &audioTaskHandle,
+        0    // Core 0で実行
     );
+
     // スプライトの初期化
     sprite.setColorDepth(8);
     sprite.createSprite(320, 240);
     sprite.setTextSize(2);
-    
+
     // 起動画面表示
     sprite.fillSprite(BLACK);
     sprite.setCursor(10, 10);
@@ -651,20 +733,31 @@ void setup() {
         sprite.fillSprite(BLACK);
         sprite.println("weight i2c error");
         sprite.pushSprite(0, 0);
-        playErrorSound();
+        playSystemSound(SOUND_ERROR); 
         delay(1000);
     }
 
-    // 起動音を鳴らす
-    //    playStartupSound();
+    // 起動音を再生
+    playSystemSound(SOUND_INFO);
     
     // 保存されたキャリブレーション係数を読み込む
     loadCalibrationFactor();
-    
+
+    // 設定ファイルの読み込み
+    if (!loadNetworkConfig()) {
+        M5.Lcd.println("Config load failed");
+        delay(2000);
+    }
+
+    // WiFi接続処理の追加
+    connectToWiFi();
+
+    // NTP設定
+    configTime(9 * 3600, 0, "ntp.nict.jp", "time.google.com");
+
     // 初期オフセットの設定
     delay(1000);
     setInitialOffset();
-
 }
 
 void loop() {
@@ -695,9 +788,17 @@ void loop() {
     if (M5.BtnB.wasPressed()) {
         calibrate();
     }
-    
+
+    // ボタンC（オフラインモード切り替え）
+    if (M5.BtnC.wasPressed()) {
+        isOfflineMode = !isOfflineMode;
+        if (!isOfflineMode) {
+            connectToWiFi(); // オンラインモードに戻す時にWiFi再接続
+        }
+    }
+
     float weight = getAccurateWeight();
     displayWeight(weight);
     
-    delay(100); // より短いディレイに変更
+    delay(50); // より短いディレイに変更
 }

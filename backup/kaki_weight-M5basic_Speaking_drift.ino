@@ -1,4 +1,4 @@
-/**
+/*
  * @file weight_i2c.ino
  * @brief TAL221ロードセル用の重量測定プログラム（M5Stack Core用）
  * Button A: オフセット設定
@@ -18,8 +18,6 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
-// 音階定義
-
 // 基本設定
 const float MAX_WEIGHT = 1000.0;   // 最大計測重量 (g)
 const float KNOWN_WEIGHT = 100.0; // キャリブレーション用の既知の重さ (g)
@@ -37,15 +35,18 @@ const int STABILITY_INTERVAL = 200;      // サンプリング間隔(ms)
 const float ZERO_THRESHOLD = 0.5;       // ゼロ判定のための閾値(g)
 const int SAMPLES = 6 ;                 // 平均化のためのサンプル数
 
-// 自動オフセット用の定数
-const unsigned long AUTO_OFFSET_INTERVAL = 300000;  // 5分ごとに自動オフセット
-const float AUTO_OFFSET_THRESHOLD = 1.2;          // この値以下なら自動オフセット実行
-const unsigned long STABLE_TIME = 3000;           // 3秒間安定していること
+// ドリフト補正用の定数
+const float DRIFT_THRESHOLD = 1.2;      // ドリフト補正を開始する閾値 (g)
+const float MAX_DRIFT_CORRECTION = 3.0;  // 最大補正量 (g)
+const unsigned long DRIFT_CHECK_INTERVAL = 15000; // ドリフトチェック間隔 (ms)
+const unsigned long STABLE_TIME_FOR_DRIFT = 5000; // ドリフト補正に必要な安定時間 (ms)
 
-// グローバル変数
-unsigned long lastAutoOffset = 0;
+// ドリフト補正用の変数
+float driftOffset = 0.0;
+unsigned long lastDriftCheck = 0;
 unsigned long stableStartTime = 0;
-bool isStableForOffset = false;
+bool isStableForDrift = false;
+
 
 // 測定状態を表す列挙型
 enum MeasurementState {
@@ -54,8 +55,6 @@ enum MeasurementState {
     STATE_STABLE,        // 測定値安定
     STATE_ZERO          // ゼロ状態
 };
-
-
 
 // 柿のサイズ判定用の構造体
 struct SizeRange {
@@ -395,10 +394,14 @@ void setInitialOffset() {
     previousState = STATE_READY;
     lastStableWeight = 0.0;
     
+    // ドリフト補正をリセット
+    driftOffset = 0.0;
+    lastDriftCheck = millis();
+    isStableForDrift = false;
+    
     M5.Lcd.println("Offset Complete!");
-    playSystemSound(SOUND_INFO);  // オフセット完了時
-    delay(1000);
-}
+    playSystemSound(SOUND_INFO);
+    delay(1000);}
 
 
 void calibrate() {
@@ -466,6 +469,9 @@ float getAccurateWeight() {
     float rawWeight = getAveragedWeight(SAMPLES);
     float calibratedWeight = rawWeight * calibration_factor;
     
+    // ドリフト補正を適用
+    calibratedWeight -= driftOffset;
+    
     // 1g未満は四捨五入
     calibratedWeight = round(calibratedWeight);
     
@@ -476,6 +482,43 @@ float getAccurateWeight() {
     return calibratedWeight;
 }
 
+// ドリフト補正のチェックと実行
+void checkAndCorrectDrift(float currentWeight) {
+    unsigned long currentTime = millis();
+    
+    // 重量が安定しているかチェック
+    if (weightBuffer.isStable() && currentWeight < DRIFT_THRESHOLD) {
+        if (!isStableForDrift) {
+            stableStartTime = currentTime;
+            isStableForDrift = true;
+        }
+        
+        // 一定時間安定していて、かつチェック間隔を超えている場合
+        if ((currentTime - stableStartTime) >= STABLE_TIME_FOR_DRIFT &&
+            (currentTime - lastDriftCheck) >= DRIFT_CHECK_INTERVAL) {
+            
+            // 複数回のサンプリングによる平均値を使用
+            float sumDrift = 0;
+            for (int i = 0; i < 5; i++) {
+                sumDrift += getAveragedWeight(SAMPLES);
+                delay(50);
+            }
+            float avgDrift = sumDrift / 5;
+            
+            // 極端な補正を避ける
+            if (abs(avgDrift) <= MAX_DRIFT_CORRECTION && 
+                abs(avgDrift - driftOffset) < 0.5) {  // 急激な変化を制限
+                
+                // 緩やかな補正を適用
+                driftOffset = driftOffset * 0.8 + avgDrift * 0.2;  // 補正値を徐々に適用
+                
+                lastDriftCheck = currentTime;
+            }
+        }
+    } else {
+        isStableForDrift = false;
+    }
+}
 
 void updateMeasurementState(float weight) {
     previousState = currentState;
@@ -582,32 +625,6 @@ void sendToGAS(const char* size, float weight) {
 
     int httpResponseCode = http.POST(jsonString);
     http.end();
-}
-
-// 自動オフセットのチェックと実行
-void checkAndAutoOffset(float weight) {
-    unsigned long currentTime = millis();
-    
-    // 重量が閾値以下で安定している場合
-    if (abs(weight) < AUTO_OFFSET_THRESHOLD && weightBuffer.isStable()) {
-        if (!isStableForOffset) {
-            stableStartTime = currentTime;
-            isStableForOffset = true;
-        }
-        
-        // 一定時間安定していて、前回のオフセットから十分時間が経過
-        if ((currentTime - stableStartTime) >= STABLE_TIME && 
-            (currentTime - lastAutoOffset) >= AUTO_OFFSET_INTERVAL) {
-            
-            weight_i2c.setOffset();  // オフセットを実行
-            lastAutoOffset = currentTime;
-            
-            // デバッグ用（必要に応じてコメントアウト）
-            Serial.println("Auto offset executed");
-        }
-    } else {
-        isStableForOffset = false;
-    }
 }
 
 // 画面表示関数
@@ -809,14 +826,14 @@ void loop() {
             speakerReinitTime = millis();
         }
     }
-
+/*
     // スピーカー再初期化の処理
     if (waitingForSpeakerReinit && (millis() - speakerReinitTime >= SPEAKER_REINIT_DELAY)) {
         M5.Speaker.begin();
         M5.Speaker.setVolume(TONE_VOLUME);
         waitingForSpeakerReinit = false;
     }
-
+*/
     // ボタンA（オフセット設定）
     if (M5.BtnA.wasPressed()) {
         setInitialOffset();
@@ -836,7 +853,9 @@ void loop() {
     }
 
     float weight = getAccurateWeight();
-    checkAndAutoOffset(weight);  // 自動オフセットのチェック
+
+    // ドリフトチェックと補正
+    checkAndCorrectDrift(weight);
     displayWeight(weight);
     
     delay(50); // より短いディレイに変更
