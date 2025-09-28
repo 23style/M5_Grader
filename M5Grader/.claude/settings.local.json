@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/myWork/Arduino2/basic2.7/kaki_weight-M5basic_Speaking/**)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
