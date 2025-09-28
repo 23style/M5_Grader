@@ -16,70 +16,70 @@
         "min_weight": 350,
         "max_weight": 999,
         "sound_file": "/6L.wav",
-        "color": "#F800"
+        "color": "#FF0000"
       },
       {
         "name": "5L",
         "min_weight": 320,
         "max_weight": 349,
         "sound_file": "/5L.wav",
-        "color": "#F81F"
+        "color": "#FF00FF"
       },
       {
         "name": "4L",
         "min_weight": 290,
         "max_weight": 319,
         "sound_file": "/4L.wav",
-        "color": "#780F"
+        "color": "#800080"
       },
       {
         "name": "3L",
         "min_weight": 260,
         "max_weight": 289,
         "sound_file": "/3L.wav",
-        "color": "#001F"
+        "color": "#0000FF"
       },
       {
         "name": "2L",
         "min_weight": 220,
         "max_weight": 259,
         "sound_file": "/2L.wav",
-        "color": "#07FF"
+        "color": "#00FFFF"
       },
       {
         "name": "L",
         "min_weight": 190,
         "max_weight": 219,
         "sound_file": "/L.wav",
-        "color": "#07E0"
+        "color": "#00FF00"
       },
       {
         "name": "M",
         "min_weight": 160,
         "max_weight": 189,
         "sound_file": "/M.wav",
-        "color": "#FFE0"
+        "color": "#FFFF00"
       },
       {
         "name": "S",
         "min_weight": 130,
         "max_weight": 159,
         "sound_file": "/S.wav",
-        "color": "#FBE0"
+        "color": "#FFA500"
       },
       {
         "name": "2S",
         "min_weight": 100,
         "max_weight": 129,
         "sound_file": "/2S.wav",
-        "color": "#C618"
+        "color": "#C0C0C0"
       },
       {
         "name": "3S",
         "min_weight": 50,
         "max_weight": 99,
         "sound_file": "/3S.wav",
-        "color": "#8410"
+        "color": "#808080"
       }
     ]
   }

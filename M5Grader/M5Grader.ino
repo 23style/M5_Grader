@@ -669,14 +669,49 @@ bool loadNetworkConfig() {
 }
 
 // WiFi接続関数
-void connectToWiFi() {
-    if (isOfflineMode) return;
-    
+bool connectToWiFi() {
+    if (isOfflineMode) return false;
+
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.println("Connecting WiFi...");
+    M5.Lcd.printf("SSID: %s\n", networkConfig.ssid.c_str());
+
     WiFi.begin(networkConfig.ssid.c_str(), networkConfig.password.c_str());
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        M5.Lcd.print(".");
         delay(500);
         attempts++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        M5.Lcd.fillScreen(GREEN);
+        M5.Lcd.setTextColor(WHITE);
+        M5.Lcd.setCursor(10, 10);
+        M5.Lcd.println("WiFi Connected!");
+        M5.Lcd.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+        playSystemSound(SOUND_INFO);
+        delay(2000);
+        return true;
+    } else {
+        M5.Lcd.fillScreen(YELLOW);
+        M5.Lcd.setTextColor(BLACK);
+        M5.Lcd.setTextSize(2);
+        M5.Lcd.setCursor(10, 10);
+        M5.Lcd.println("WARNING:");
+        M5.Lcd.println("WiFi connection failed");
+        M5.Lcd.println("");
+        M5.Lcd.println("Switching to");
+        M5.Lcd.println("OFFLINE MODE");
+        M5.Lcd.println("");
+        M5.Lcd.printf("SSID: %s\n", networkConfig.ssid.c_str());
+        M5.Lcd.println("Check settings");
+        playSystemSound(SOUND_ERROR);
+        delay(3000);
+        isOfflineMode = true;
+        return false;
     }
 }
 
@@ -708,6 +743,22 @@ void sendToGAS(const char* size, float weight) {
     serializeJson(doc, jsonString);
 
     int httpResponseCode = http.POST(jsonString);
+
+    // エラーハンドリング
+    if (httpResponseCode != 200) {
+        // 画面にエラーを一時的に表示
+        sprite.fillSprite(RED);
+        sprite.setTextColor(WHITE, RED);
+        sprite.setTextSize(2);
+        sprite.setCursor(10, 100);
+        sprite.print("GAS ERROR");
+        sprite.setCursor(10, 130);
+        sprite.printf("Code: %d", httpResponseCode);
+        sprite.pushSprite(0, 0);
+        playSystemSound(SOUND_ERROR);
+        delay(2000);
+    }
+
     http.end();
 }
 
@@ -965,9 +1016,35 @@ void loop() {
 
     // ボタンC（オフラインモード切り替え）
     if (M5.BtnC.wasPressed()) {
-        isOfflineMode = !isOfflineMode;
-        if (!isOfflineMode) {
-            connectToWiFi(); // オンラインモードに戻す時にWiFi再接続
+        if (isOfflineMode) {
+            // オフライン→オンライン切り替え時
+            isOfflineMode = false;
+            if (!connectToWiFi()) {
+                // WiFi接続失敗時はオフラインモードに戻す
+                M5.Lcd.fillScreen(RED);
+                M5.Lcd.setTextColor(WHITE);
+                M5.Lcd.setTextSize(2);
+                M5.Lcd.setCursor(10, 10);
+                M5.Lcd.println("ERROR:");
+                M5.Lcd.println("Cannot connect WiFi");
+                M5.Lcd.println("");
+                M5.Lcd.println("Staying in");
+                M5.Lcd.println("OFFLINE MODE");
+                playSystemSound(SOUND_ERROR);
+                delay(2000);
+                isOfflineMode = true;
+            }
+        } else {
+            // オンライン→オフライン切り替え時
+            isOfflineMode = true;
+            M5.Lcd.fillScreen(BLUE);
+            M5.Lcd.setTextColor(WHITE);
+            M5.Lcd.setTextSize(2);
+            M5.Lcd.setCursor(10, 10);
+            M5.Lcd.println("Switched to");
+            M5.Lcd.println("OFFLINE MODE");
+            playSystemSound(SOUND_INFO);
+            delay(1000);
         }
     }
 
