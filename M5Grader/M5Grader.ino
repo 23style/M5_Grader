@@ -835,7 +835,20 @@ void displayWeight(float weight) {
         sprite.print("Offset");
         sprite.setCursor(130, 220);
         sprite.print("Calibrate");
-        
+
+        // デバイスID表示（最上位レイヤー）
+        String deviceIdStr = String(networkConfig.device_id);
+        int idWidth = sprite.textWidth(deviceIdStr.c_str()) + 8;
+        int idHeight = 20;
+        int idX = 320 - idWidth - 5;  // 右端から5px余白
+        int idY = 5;  // 上端から5px余白
+
+        // デバイスIDを黒文字で表示
+        sprite.setTextColor(BLACK, WHITE);
+        sprite.setTextSize(3);
+        sprite.setCursor(idX + 4, idY + 6);
+        sprite.print(deviceIdStr);
+
         sprite.pushSprite(0, 0);
         
         // 状態が安定してGASにまだ送信していない場合、データを送信
