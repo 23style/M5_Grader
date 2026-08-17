@@ -26,11 +26,11 @@ const char* CALIB_FILE = "/weight_calibration.txt";
 const int TONE_VOLUME = 3;
 
 // 測定パラメータ（高速＋トリム平均で精度確保）
-const int SAMPLES = 5;                    // 平均化サンプル数（min/max除去した中央3サンプル平均）
-const int SAMPLE_INTERVAL_MS = 5;         // サンプル間隔
+const int SAMPLES = 7;                    // 平均化サンプル数（min/max除去した中央5サンプル平均）
+const int SAMPLE_INTERVAL_MS = 10;        // サンプル間隔
 const int STABILITY_SAMPLES = 4;          // 安定性判定履歴数
 const int STABILITY_INTERVAL = 100;       // 表示更新・安定判定周期(ms)
-const float ZERO_THRESHOLD = 0.5;         // ゼロ判定閾値(g)
+const float ZERO_THRESHOLD = 2.0;         // ゼロ判定閾値(g)
 const int ZERO_DEBOUNCE_COUNT = 3;        // ZERO遷移に必要な連続near-zero回数（触れによる誤遷移防止）
 
 // 確認ダイアログ
@@ -101,6 +101,15 @@ struct WeightReading {
             max_val = max(max_val, values[i]);
         }
         return (max_val - min_val) <= threshold;
+    }
+
+    // バッファ内平均。ラッチ確定時、丸め境界での±1g誤差を排除するために使用
+    float average() {
+        int count = isFull ? STABILITY_SAMPLES : index;
+        if (count == 0) return 0.0;
+        float sum = 0.0;
+        for (int i = 0; i < count; i++) sum += values[i];
+        return sum / count;
     }
 
     void clear() {
@@ -1230,11 +1239,13 @@ void renderDisplay(float liveWeight) {
         sprite.setTextFont(0);
     }
 
-    // 重量表示
+    // 重量表示（ライブ値は float なのでゼロ近傍を丸めてから四捨五入）
+    int displayInt = (int)round(displayWeight);
+    if (abs(displayWeight) < ZERO_THRESHOLD) displayInt = 0;
     sprite.setTextColor(WHITE, BLACK);
     sprite.setTextSize(3);
     char weightStr[20];
-    sprintf(weightStr, "%dg", (int)displayWeight);
+    sprintf(weightStr, "%dg", displayInt);
     int tw = sprite.textWidth(weightStr);
     sprite.setCursor((320 - tw) / 2, 190);
     sprite.print(weightStr);
@@ -1308,11 +1319,14 @@ void updateDisplay(float weight) {
     updateMeasurementState(weight);
 
     // 安定判定に「入った」瞬間のみ、結果をラッチして音声再生・ログ追記を1回だけ実行
+    // バッファ4サンプルの平均を四捨五入することで、丸め境界付近での±1g誤差を排除
     if (currentState == STATE_STABLE && !wasStable) {
-        String grade = determineGrade(weight);
-        if (weight >= productSettings.minWeight) {
+        float stableAvg = weightBuffer.average();
+        float finalWeight = round(stableAvg);
+        String grade = determineGrade(finalWeight);
+        if (finalWeight >= productSettings.minWeight) {
             latchedGrade = grade;
-            latchedWeight = weight;
+            latchedWeight = finalWeight;
             playGradeSound(latchedGrade);
             appendToLog(latchedGrade.c_str(), latchedWeight);
         }
@@ -1383,11 +1397,10 @@ void loop() {
     // B ボタンは通常時は無反応（メニュー内でのみ使用）
     if (M5.BtnC.wasPressed()) showMenu();
 
-    // トリム平均で外れ値除去した生値を取得
+    // トリム平均で外れ値除去した生値を取得。以降は float のまま扱い、
+    // 安定判定・ラッチ・表示の直前で丸めることで境界付近の ±1g 誤差を排除する。
     float rawCalibrated = readTrimmedMeanRaw() * calibration_factor;
     float weight = rawCalibrated - softZeroOffset;
-    weight = round(weight);
-    if (abs(weight) < ZERO_THRESHOLD) weight = 0;
 
     updateDisplay(weight);
     updateZeroTracking(weight, rawCalibrated);
