@@ -656,6 +656,9 @@ void updateZeroTracking(float displayedWeight, float rawCalibratedWeight) {
     }
 }
 
+// 前方宣言（loadNetworkConfig 内から呼び出す）
+void showRecordOffAutoDisabled(const char* reason);
+
 // 設定ファイル読み込み
 void loadNetworkConfig() {
     M5.Lcd.fillScreen(BLACK);
@@ -690,17 +693,24 @@ void loadNetworkConfig() {
         while (1);
     }
 
-    if (!doc.containsKey("wifi") || !doc.containsKey("gas_url")) {
-        showFatalError("Missing network config", {"Required fields:", "- wifi", "- gas_url"});
-    }
+    // ネットワーク設定不足時は Record OFF に自動切替（起動継続、後段で警告表示）
+    // wifi/gas_url が欠けている場合、空文字で初期化しておく
+    bool hasNetworkConfig = doc.containsKey("wifi") && doc.containsKey("gas_url");
 
-    networkConfig.ssid = doc["wifi"]["ssid"].as<String>();
-    networkConfig.password = doc["wifi"]["password"].as<String>();
-    networkConfig.gas_url = doc["gas_url"].as<String>();
+    if (hasNetworkConfig) {
+        networkConfig.ssid = doc["wifi"]["ssid"].as<String>();
+        networkConfig.password = doc["wifi"]["password"].as<String>();
+        networkConfig.gas_url = doc["gas_url"].as<String>();
+    } else {
+        networkConfig.ssid = "";
+        networkConfig.password = "";
+        networkConfig.gas_url = "";
+    }
     networkConfig.device_id = doc["device_id"] | 1;
 
-    // 記録ON/OFFフラグ（デフォルトON）
+    // 記録ON/OFFフラグ（デフォルトON）。ネットワーク設定不足時は強制OFF
     recordingEnabled = doc["recording_enabled"] | true;
+    if (!hasNetworkConfig) recordingEnabled = false;
 
     if (!doc.containsKey("product_settings")) {
         showFatalError("Missing product_settings", {"Required in config.json:", "- product_settings"});
@@ -741,6 +751,11 @@ void loadNetworkConfig() {
     M5.Lcd.printf("Product: %s\n", productSettings.productName.c_str());
     M5.Lcd.printf("Grades: %d\n", productSettings.grades.size());
     delay(2000);
+
+    // ネットワーク設定不足時：Record OFF自動切替の警告
+    if (!hasNetworkConfig) {
+        showRecordOffAutoDisabled("Network config missing");
+    }
 }
 
 // WiFi接続（アップロード時のみ使用）
@@ -767,6 +782,65 @@ bool connectToWiFi() {
 void disconnectWiFi() {
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
+}
+
+// Record OFF自動切替の警告表示（3秒）
+// 起動時のネットワーク設定不足／WiFi接続失敗で共通利用
+void showRecordOffAutoDisabled(const char* reason) {
+    M5.Lcd.fillScreen(RED);
+    M5.Lcd.setTextColor(WHITE, RED);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.println("WARNING:");
+    M5.Lcd.println(reason);
+    M5.Lcd.println("");
+    M5.Lcd.println("Record: OFF");
+    M5.Lcd.println("(auto disabled)");
+    delay(3000);
+}
+
+// 起動時のNTP同期試行
+// 戻り値: WiFi接続に成功したら true、失敗したら false（呼び出し側でRecord OFFに切替）
+// 設計書 4.3.3 に基づき、NTP同期失敗はBoot+Nmsフォールバックで継続、WiFi接続失敗はRecord OFFに切替
+bool syncTimeAtBoot() {
+    if (!connectToWiFi()) {
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        showRecordOffAutoDisabled("WiFi failed");
+        return false;
+    }
+
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.println("Syncing time...");
+
+    configTime(9 * 3600, 0, "ntp.nict.jp", "time.google.com");
+
+    struct tm timeinfo;
+    unsigned long start = millis();
+    bool synced = false;
+    while (millis() - start < 5000) {
+        if (getLocalTime(&timeinfo, 100)) {
+            synced = true;
+            break;
+        }
+    }
+
+    if (synced) {
+        char buf[32];
+        strftime(buf, sizeof(buf), "%Y/%m/%d %H:%M:%S", &timeinfo);
+        M5.Lcd.setCursor(10, 40);
+        M5.Lcd.println("OK:");
+        M5.Lcd.println(buf);
+    } else {
+        M5.Lcd.setCursor(10, 40);
+        M5.Lcd.println("NTP failed");
+    }
+    delay(1200);
+
+    disconnectWiFi();
+    return true;
 }
 
 // 現在時刻を文字列化（NTP同期していれば実時刻、そうでなければ Boot+Nms 形式）
@@ -865,8 +939,56 @@ void initRotationCounter() {
     rotationCounter = maxN + 1;
 }
 
+// Record ON切替時のWiFi失敗を赤画面で通知（Cボタンで閉じる／最大30秒）
+void showRecordEnableWifiError() {
+    M5.Lcd.fillScreen(RED);
+    M5.Lcd.setTextColor(WHITE, RED);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.println("ERROR:");
+    M5.Lcd.println("WiFi failed");
+    M5.Lcd.println("");
+    M5.Lcd.printf("SSID: %s\n", networkConfig.ssid.c_str());
+    M5.Lcd.println("");
+    M5.Lcd.println("Record stays OFF.");
+    M5.Lcd.setCursor(10, 210);
+    M5.Lcd.print("C: close");
+
+    drainButtonEvents();
+    unsigned long start = millis();
+    while (millis() - start < 30000) {
+        M5.update();
+        if (M5.BtnC.wasPressed()) break;
+        delay(20);
+    }
+    drainButtonEvents();
+}
+
 // config.json の recording_enabled フィールドを更新して書き戻す
+// OFF→ON 切替時はWiFi接続+NTP同期を試行し、失敗時は OFF のまま維持（config.jsonも更新しない）
 void saveRecordingFlag(bool enabled) {
+    // OFF→ON 切替：WiFi接続+NTP同期を先に試みる
+    if (enabled && !recordingEnabled) {
+        if (!connectToWiFi()) {
+            disconnectWiFi();
+            showRecordEnableWifiError();
+            return;  // recordingEnabled は false のまま、config.json も更新しない
+        }
+
+        M5.Lcd.fillScreen(BLACK);
+        M5.Lcd.setTextSize(2);
+        M5.Lcd.setCursor(10, 10);
+        M5.Lcd.println("Syncing time...");
+
+        configTime(9 * 3600, 0, "ntp.nict.jp", "time.google.com");
+        struct tm timeinfo;
+        unsigned long start = millis();
+        while (millis() - start < 5000) {
+            if (getLocalTime(&timeinfo, 100)) break;
+        }
+        disconnectWiFi();
+    }
+
     File src = SD.open("/config.json", FILE_READ);
     if (!src) return;
     DynamicJsonDocument doc(4096);
@@ -1295,13 +1417,19 @@ void renderDisplay(float liveWeight) {
         sprite.print("REC OFF");
     }
 
-    // デバイスID
+    // デバイスID（白背景を一回り大きく描画して視認性を確保）
     String deviceIdStr = String(networkConfig.device_id);
-    int idWidth = sprite.textWidth(deviceIdStr.c_str()) + 8;
-    int idX = 320 - idWidth - 5;
-    sprite.setTextColor(BLACK, WHITE);
     sprite.setTextSize(3);
-    sprite.setCursor(idX + 4, 11);
+    int textW = sprite.textWidth(deviceIdStr.c_str());
+    const int padX = 8;
+    const int padY = 6;
+    int boxW = textW + padX * 2;
+    int boxH = 24 + padY * 2;   // size=3 の文字高さ ~24px
+    int boxX = 320 - boxW - 5;
+    int boxY = 5;
+    sprite.fillRect(boxX, boxY, boxW, boxH, WHITE);
+    sprite.setTextColor(BLACK, WHITE);
+    sprite.setCursor(boxX + padX, boxY + padY);
     sprite.print(deviceIdStr);
 
     sprite.pushSprite(0, 0);
@@ -1380,7 +1508,15 @@ void setup() {
 
     loadCalibrationFactor();
     loadNetworkConfig();
-    // WiFi は起動時に接続しない。Uploadボタン押下時のみ接続する。
+
+    // 起動時NTP同期は記録モードON時のみ実行
+    // WiFi接続失敗時はRecord OFFに自動切替（config.jsonは書き換えない）
+    // NTP同期失敗時はBoot+Nmsフォールバックで継続（Record ONのまま）
+    if (recordingEnabled) {
+        if (!syncTimeAtBoot()) {
+            recordingEnabled = false;
+        }
+    }
 
     // 未アップロードのレコード数を集計、ローテーションカウンタも初期化
     initRotationCounter();
